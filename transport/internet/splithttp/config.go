@@ -50,6 +50,9 @@ func (c *Config) GetNormalizedQuery() string {
 func (c *Config) GetRequestHeader() http.Header {
 	header := http.Header{}
 	for k, v := range c.Headers {
+		if k == clientGenerationConfigMarker {
+			continue
+		}
 		header.Add(k, v)
 	}
 	utils.TryDefaultHeadersWith(header, "fetch")

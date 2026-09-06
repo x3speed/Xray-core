@@ -29,6 +29,7 @@ type XmuxManager struct {
 	connections int32
 	newConnFunc func() XmuxConn
 	xmuxClients []*XmuxClient
+	retired     bool
 }
 
 func NewXmuxManager(xmuxConfig XmuxConfig, newConnFunc func() XmuxConn) *XmuxManager {
@@ -61,6 +62,9 @@ func (m *XmuxManager) newXmuxClient() *XmuxClient {
 }
 
 func (m *XmuxManager) GetXmuxClient(ctx context.Context) *XmuxClient { // when locking
+	if m.retired {
+		return nil
+	}
 	for i := 0; i < len(m.xmuxClients); {
 		xmuxClient := m.xmuxClients[i]
 		if xmuxClient.XmuxConn.IsClosed() ||
@@ -110,4 +114,10 @@ func (m *XmuxManager) GetXmuxClient(ctx context.Context) *XmuxClient { // when l
 		xmuxClient.leftUsage -= 1
 	}
 	return xmuxClient
+}
+
+func (m *XmuxManager) retire() {
+	m.retired = true
+	m.newConnFunc = nil
+	m.xmuxClients = nil
 }

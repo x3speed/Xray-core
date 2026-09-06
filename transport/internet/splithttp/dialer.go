@@ -44,11 +44,20 @@ var (
 	globalDialerAccess sync.Mutex
 )
 
-func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (DialerClient, *XmuxClient) {
+func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (DialerClient, *XmuxClient, error) {
+	transportConfig := streamSettings.ProtocolSettings.(*Config)
+	token, managed, err := clientGenerationFromConfig(transportConfig)
+	if err != nil {
+		return nil, nil, err
+	}
+	if managed {
+		return getManagedHTTPClient(ctx, dest, streamSettings, token)
+	}
+
 	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
 
 	if browser_dialer.HasBrowserDialer() && realityConfig == nil {
-		return &BrowserDialerClient{transportConfig: streamSettings.ProtocolSettings.(*Config)}, nil
+		return &BrowserDialerClient{transportConfig: transportConfig}, nil, nil
 	}
 
 	globalDialerAccess.Lock()
@@ -63,7 +72,6 @@ func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *in
 	xmuxManager, found := globalDialerMap[key]
 
 	if !found {
-		transportConfig := streamSettings.ProtocolSettings.(*Config)
 		var xmuxConfig XmuxConfig
 		if transportConfig.Xmux != nil {
 			xmuxConfig = *transportConfig.Xmux
@@ -76,7 +84,43 @@ func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *in
 	}
 
 	xmuxClient := xmuxManager.GetXmuxClient(ctx)
-	return xmuxClient.XmuxConn.(DialerClient), xmuxClient
+	return xmuxClient.XmuxConn.(DialerClient), xmuxClient, nil
+}
+
+func getManagedHTTPClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig, token ClientGeneration) (DialerClient, *XmuxClient, error) {
+	if browser_dialer.HasBrowserDialer() && reality.ConfigFromStreamSettings(streamSettings) == nil {
+		return nil, nil, fmt.Errorf("%w: browser dialer has no managed lifecycle", ErrClientGenerationUnavailable)
+	}
+
+	clientGenerations.Lock()
+	defer clientGenerations.Unlock()
+	state := clientGenerations.active
+	if state == nil || state.token != token {
+		return nil, nil, ErrClientGenerationUnavailable
+	}
+
+	key := dialerConf{dest, streamSettings}
+	xmuxManager, found := state.cache[key]
+	if !found {
+		transportConfig := streamSettings.ProtocolSettings.(*Config)
+		var xmuxConfig XmuxConfig
+		if transportConfig.Xmux != nil {
+			xmuxConfig = *transportConfig.Xmux
+		}
+
+		xmuxManager = NewXmuxManager(xmuxConfig, func() XmuxConn {
+			client := newManagedDialerClient(state, createHTTPClient(dest, streamSettings))
+			state.clients[client] = struct{}{}
+			return client
+		})
+		state.cache[key] = xmuxManager
+	}
+
+	xmuxClient := xmuxManager.GetXmuxClient(ctx)
+	if xmuxClient == nil {
+		return nil, nil, ErrClientGenerationUnavailable
+	}
+	return xmuxClient.XmuxConn.(DialerClient), xmuxClient, nil
 }
 
 func decideHTTPVersion(tlsConfig *tls.Config, realityConfig *reality.Config) string {
@@ -355,6 +399,11 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	}
 
 	transportConfiguration := streamSettings.ProtocolSettings.(*Config)
+	generation, finishDial, err := beginDialGeneration(transportConfiguration)
+	if err != nil {
+		return nil, err
+	}
+	defer finishDial()
 	var requestURL url.URL
 
 	if tlsConfig != nil || realityConfig != nil {
@@ -376,7 +425,10 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	requestURL.Path = transportConfiguration.GetNormalizedPath()
 	requestURL.RawQuery = transportConfiguration.GetNormalizedQuery()
 
-	httpClient, xmuxClient := getHTTPClient(ctx, dest, streamSettings)
+	httpClient, xmuxClient, err := getHTTPClient(ctx, dest, streamSettings)
+	if err != nil {
+		return nil, err
+	}
 
 	mode := transportConfiguration.Mode
 	if mode == "" || mode == "auto" {
@@ -423,6 +475,11 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			requestURL2.Scheme = "http"
 		}
 		config2 := memory2.ProtocolSettings.(*Config)
+		if generation != nil {
+			if err := BindClientGeneration(config2, generation.token); err != nil {
+				return nil, err
+			}
+		}
 		requestURL2.Host = config2.Host
 		if requestURL2.Host == "" && tlsConfig2 != nil {
 			requestURL2.Host = tlsConfig2.ServerName
@@ -435,7 +492,10 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		}
 		requestURL2.Path = config2.GetNormalizedPath()
 		requestURL2.RawQuery = config2.GetNormalizedQuery()
-		httpClient2, xmuxClient2 = getHTTPClient(ctx, dest2, memory2)
+		httpClient2, xmuxClient2, err = getHTTPClient(ctx, dest2, memory2)
+		if err != nil {
+			return nil, err
+		}
 		errors.LogInfo(ctx, fmt.Sprintf("XHTTP is downloading from %s, mode %s, HTTP version %s, host %s", dest2, "stream-down", httpVersion2, requestURL2.Host))
 	}
 
@@ -463,7 +523,6 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		},
 	}
 
-	var err error
 	if mode == "stream-one" {
 		requestURL.Path = transportConfiguration.GetNormalizedPath()
 		if xmuxClient != nil {
@@ -513,7 +572,16 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		maxUploadSize,
 	}
 
+	finishUpload := func() {}
+	if generation != nil {
+		finishUpload, err = generation.beginActivity()
+		if err != nil {
+			uploadPipeReader.Interrupt()
+			return nil, err
+		}
+	}
 	go func() {
+		defer finishUpload()
 		var seq int64
 		var lastWrite time.Time
 
@@ -553,7 +621,14 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 
 				if xmuxClient != nil && (xmuxClient.LeftRequests.Add(-1) <= 0 ||
 					(xmuxClient.UnreusableAt != time.Time{} && lastWrite.After(xmuxClient.UnreusableAt))) {
-					httpClient, xmuxClient = getHTTPClient(ctx, dest, streamSettings)
+					nextHTTPClient, nextXmuxClient, err := getHTTPClient(ctx, dest, streamSettings)
+					if err != nil {
+						errors.LogInfoInner(ctx, err, "failed to acquire managed upload client")
+						uploadPipeReader.Interrupt()
+						doSplit.Store(false)
+						break
+					}
+					httpClient, xmuxClient = nextHTTPClient, nextXmuxClient
 				}
 
 				go func() {
