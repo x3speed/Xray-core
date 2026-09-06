@@ -102,6 +102,9 @@ func getManagedHTTPClient(ctx context.Context, dest net.Destination, streamSetti
 	key := dialerConf{dest, streamSettings}
 	xmuxManager, found := state.cache[key]
 	if !found {
+		if len(state.cache) >= maxManagedDialerEntries {
+			return nil, nil, ErrClientGenerationCacheFull
+		}
 		transportConfig := streamSettings.ProtocolSettings.(*Config)
 		var xmuxConfig XmuxConfig
 		if transportConfig.Xmux != nil {
@@ -113,10 +116,18 @@ func getManagedHTTPClient(ctx context.Context, dest net.Destination, streamSetti
 			state.clients[client] = struct{}{}
 			return client
 		})
+		xmuxManager.trackRetired = true
 		state.cache[key] = xmuxManager
 	}
 
 	xmuxClient := xmuxManager.GetXmuxClient(ctx)
+	for _, retired := range xmuxManager.takeRetired() {
+		client, ok := retired.(*managedDialerClient)
+		if !ok {
+			return nil, nil, ErrClientGenerationUnavailable
+		}
+		state.retireClientLocked(client)
+	}
 	if xmuxClient == nil {
 		return nil, nil, ErrClientGenerationUnavailable
 	}
@@ -647,7 +658,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 					}
 				}()
 
-				if _, ok := httpClient.(*DefaultDialerClient); ok {
+				if waitsForWroteRequest(httpClient) {
 					<-wroteRequest.Wait()
 				}
 			}

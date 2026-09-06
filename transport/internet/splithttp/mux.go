@@ -24,12 +24,14 @@ type XmuxClient struct {
 }
 
 type XmuxManager struct {
-	xmuxConfig  XmuxConfig
-	concurrency int32
-	connections int32
-	newConnFunc func() XmuxConn
-	xmuxClients []*XmuxClient
-	retired     bool
+	xmuxConfig   XmuxConfig
+	concurrency  int32
+	connections  int32
+	newConnFunc  func() XmuxConn
+	xmuxClients  []*XmuxClient
+	retired      bool
+	trackRetired bool
+	retiredConns []XmuxConn
 }
 
 func NewXmuxManager(xmuxConfig XmuxConfig, newConnFunc func() XmuxConn) *XmuxManager {
@@ -77,6 +79,9 @@ func (m *XmuxManager) GetXmuxClient(ctx context.Context) *XmuxClient { // when l
 				", LeftRequests = ", xmuxClient.LeftRequests.Load(),
 				", UnreusableAt = ", xmuxClient.UnreusableAt)
 			m.xmuxClients = append(m.xmuxClients[:i], m.xmuxClients[i+1:]...)
+			if m.trackRetired {
+				m.retiredConns = append(m.retiredConns, xmuxClient.XmuxConn)
+			}
 		} else {
 			i++
 		}
@@ -116,8 +121,15 @@ func (m *XmuxManager) GetXmuxClient(ctx context.Context) *XmuxClient { // when l
 	return xmuxClient
 }
 
+func (m *XmuxManager) takeRetired() []XmuxConn {
+	retired := m.retiredConns
+	m.retiredConns = nil
+	return retired
+}
+
 func (m *XmuxManager) retire() {
 	m.retired = true
 	m.newConnFunc = nil
 	m.xmuxClients = nil
+	m.retiredConns = nil
 }

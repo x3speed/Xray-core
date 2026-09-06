@@ -19,6 +19,7 @@ type ClientGeneration uint64
 var (
 	ErrClientGenerationActive      = stderrors.New("splithttp: a managed client generation is already active")
 	ErrClientGenerationUnavailable = stderrors.New("splithttp: managed client generation is unavailable")
+	ErrClientGenerationCacheFull   = stderrors.New("splithttp: managed client generation cache is full")
 	ErrClientGenerationCleanup     = stderrors.New("splithttp: managed client generation cleanup failed")
 )
 
@@ -26,6 +27,10 @@ var (
 // round-trip. GetRequestHeader always removes it before constructing HTTP
 // requests, so it is internal configuration metadata and never a wire header.
 const clientGenerationConfigMarker = "\x00xray.internal.splithttp.client-generation"
+
+// A generation has one primary upload stream setting and may have one separate
+// download stream setting. Any third MemoryStreamConfig is rejected.
+const maxManagedDialerEntries = 2
 
 type clientGenerationState struct {
 	token  ClientGeneration
@@ -36,12 +41,17 @@ type clientGenerationState struct {
 	cache   map[dialerConf]*XmuxManager
 	clients map[*managedDialerClient]struct{}
 
-	activityMu sync.Mutex
-	accepting  bool
-	activities sync.WaitGroup
-	drained    chan struct{}
-	drainOnce  sync.Once
-	cleanupErr error
+	activityMu  sync.Mutex
+	accepting   bool
+	activities  sync.WaitGroup
+	drained     chan struct{}
+	drainOnce   sync.Once
+	cleanupErr  error
+	evictionErr error
+}
+
+type clientGenerationQuarantine struct {
+	token ClientGeneration
 }
 
 var clientGenerations = struct {
@@ -49,6 +59,9 @@ var clientGenerations = struct {
 	next     ClientGeneration
 	active   *clientGenerationState
 	retiring *clientGenerationState
+	// quarantine is deliberately reference-free. A client close error is a
+	// process-lifetime terminal condition; recovery requires process restart.
+	quarantine *clientGenerationQuarantine
 }{}
 
 // BeginClientGeneration creates the sole managed SplitHTTP cache generation.
@@ -57,7 +70,7 @@ func BeginClientGeneration() (ClientGeneration, error) {
 	clientGenerations.Lock()
 	defer clientGenerations.Unlock()
 
-	if clientGenerations.active != nil || clientGenerations.retiring != nil {
+	if clientGenerations.active != nil || clientGenerations.retiring != nil || clientGenerations.quarantine != nil {
 		return 0, ErrClientGenerationActive
 	}
 	if clientGenerations.next == ^ClientGeneration(0) {
@@ -120,6 +133,14 @@ func EndClientGeneration(ctx context.Context, token ClientGeneration) error {
 	}
 
 	clientGenerations.Lock()
+	if clientGenerations.quarantine != nil {
+		quarantine := clientGenerations.quarantine
+		clientGenerations.Unlock()
+		if quarantine.token != token {
+			return ErrClientGenerationUnavailable
+		}
+		return fmt.Errorf("%w: process restart required", ErrClientGenerationCleanup)
+	}
 	state := clientGenerations.retiring
 	if state == nil {
 		state = clientGenerations.active
@@ -152,15 +173,19 @@ func EndClientGeneration(ctx context.Context, token ClientGeneration) error {
 	if clientGenerations.retiring != state {
 		return ErrClientGenerationUnavailable
 	}
-	if state.cleanupErr != nil {
-		return fmt.Errorf("%w: %w", ErrClientGenerationCleanup, state.cleanupErr)
-	}
-
+	cleanupErr := state.cleanupErr
 	for client := range state.clients {
 		client.release()
 	}
 	state.clients = nil
+	state.cache = nil
+	state.cleanupErr = nil
+	state.evictionErr = nil
 	clientGenerations.retiring = nil
+	if cleanupErr != nil {
+		clientGenerations.quarantine = &clientGenerationQuarantine{token: token}
+		return fmt.Errorf("%w: %w", ErrClientGenerationCleanup, cleanupErr)
+	}
 	return nil
 }
 
@@ -176,7 +201,11 @@ func (s *clientGenerationState) startRetireLocked() {
 	s.cache = nil
 
 	var cleanupErrors []error
+	if s.evictionErr != nil {
+		cleanupErrors = append(cleanupErrors, s.evictionErr)
+	}
 	for client := range s.clients {
+		client.prepareGenerationRetire()
 		if err := client.Close(); err != nil {
 			cleanupErrors = append(cleanupErrors, err)
 		}
@@ -188,6 +217,37 @@ func (s *clientGenerationState) startRetireLocked() {
 			close(s.drained)
 		}()
 	})
+}
+
+func (s *clientGenerationState) retireClientLocked(client *managedDialerClient) {
+	if client == nil {
+		return
+	}
+	if client.markRetired(func() { s.finishRetiredClient(client) }) {
+		s.finishRetiredClientLocked(client)
+	}
+}
+
+func (s *clientGenerationState) finishRetiredClient(client *managedDialerClient) {
+	clientGenerations.Lock()
+	defer clientGenerations.Unlock()
+	if clientGenerations.active != s && clientGenerations.retiring != s {
+		return
+	}
+	s.finishRetiredClientLocked(client)
+}
+
+func (s *clientGenerationState) finishRetiredClientLocked(client *managedDialerClient) {
+	if _, present := s.clients[client]; !present {
+		return
+	}
+	if err := client.Close(); err != nil && s.evictionErr == nil {
+		// Retain only a plain error string, never an error implementation that
+		// could itself keep transport state reachable.
+		s.evictionErr = stderrors.New(err.Error())
+	}
+	delete(s.clients, client)
+	client.release()
 }
 
 func (s *clientGenerationState) beginActivity() (func(), error) {
@@ -236,7 +296,12 @@ func beginDialGeneration(config *Config) (*clientGenerationState, func(), error)
 
 type clientGenerationContextKey struct{}
 
-func managedOperationContext(ctx context.Context, state *clientGenerationState) (context.Context, func(), error) {
+type clientGenerationOperation struct {
+	state  *clientGenerationState
+	client *managedDialerClient
+}
+
+func managedOperationContext(ctx context.Context, state *clientGenerationState, client *managedDialerClient) (context.Context, func(), error) {
 	finishActivity, err := state.beginActivity()
 	if err != nil {
 		return nil, nil, err
@@ -252,7 +317,8 @@ func managedOperationContext(ctx context.Context, state *clientGenerationState) 
 			finishActivity()
 		})
 	}
-	return context.WithValue(opCtx, clientGenerationContextKey{}, state), finish, nil
+	operation := &clientGenerationOperation{state: state, client: client}
+	return context.WithValue(opCtx, clientGenerationContextKey{}, operation), finish, nil
 }
 
 func detachedClientContext(ctx context.Context) context.Context {
@@ -263,19 +329,38 @@ func detachedClientContext(ctx context.Context) context.Context {
 }
 
 func beginManagedBackgroundActivity(ctx context.Context) (func(), error) {
-	state, _ := ctx.Value(clientGenerationContextKey{}).(*clientGenerationState)
-	if state == nil {
+	operation, _ := ctx.Value(clientGenerationContextKey{}).(*clientGenerationOperation)
+	if operation == nil {
 		return func() {}, nil
 	}
-	return state.beginActivity()
+	if err := operation.client.beginBackgroundOperation(); err != nil {
+		return nil, err
+	}
+	finishGeneration, err := operation.state.beginActivity()
+	if err != nil {
+		operation.client.finishOperation()
+		return nil, err
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			finishGeneration()
+			operation.client.finishOperation()
+		})
+	}, nil
 }
 
 type managedDialerClient struct {
-	mu      sync.Mutex
-	state   *clientGenerationState
-	inner   DialerClient
-	closed  bool
-	streams map[*managedReadCloser]struct{}
+	mu         sync.Mutex
+	state      *clientGenerationState
+	inner      DialerClient
+	closed     bool
+	retired    bool
+	operations int
+	onIdle     func()
+	streams    map[*managedReadCloser]struct{}
+	closeOnce  sync.Once
+	closeErr   error
 }
 
 func newManagedDialerClient(state *clientGenerationState, inner DialerClient) *managedDialerClient {
@@ -289,23 +374,29 @@ func newManagedDialerClient(state *clientGenerationState, inner DialerClient) *m
 	}
 }
 
+func waitsForWroteRequest(client DialerClient) bool {
+	if _, ok := client.(*DefaultDialerClient); ok {
+		return true
+	}
+	sequencer, ok := client.(interface{ waitsForWroteRequest() bool })
+	return ok && sequencer.waitsForWroteRequest()
+}
+
+func (c *managedDialerClient) waitsForWroteRequest() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, ok := c.inner.(*DefaultDialerClient)
+	return ok
+}
+
 func (c *managedDialerClient) IsClosed() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.closed || c.inner == nil || c.inner.IsClosed()
+	return c.closed || c.retired || c.inner == nil || c.inner.IsClosed()
 }
 
 func (c *managedDialerClient) OpenStream(ctx context.Context, url, sessionID string, body io.Reader, uploadOnly bool) (io.ReadCloser, net.Addr, net.Addr, error) {
-	c.mu.Lock()
-	closed := c.closed
-	state := c.state
-	inner := c.inner
-	c.mu.Unlock()
-	if closed || state == nil || inner == nil {
-		return nil, nil, nil, ErrClientGenerationUnavailable
-	}
-
-	opCtx, finish, err := managedOperationContext(ctx, state)
+	opCtx, inner, finish, err := c.beginOperation(ctx)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -315,7 +406,7 @@ func (c *managedDialerClient) OpenStream(ctx context.Context, url, sessionID str
 		return reader, remoteAddr, localAddr, err
 	}
 
-	tracked := &managedReadCloser{inner: reader, owner: c, finish: finish}
+	tracked := &managedReadCloser{inner: reader, owner: c, finishOperation: finish}
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -324,20 +415,14 @@ func (c *managedDialerClient) OpenStream(ctx context.Context, url, sessionID str
 	}
 	c.streams[tracked] = struct{}{}
 	c.mu.Unlock()
+	if notifier, ok := reader.(interface{ SetCloseCallback(func()) }); ok {
+		notifier.SetCloseCallback(tracked.finishAfterInnerClose)
+	}
 	return tracked, remoteAddr, localAddr, nil
 }
 
 func (c *managedDialerClient) PostPacket(ctx context.Context, url, sessionID, sequence string, payload buf.MultiBuffer) error {
-	c.mu.Lock()
-	closed := c.closed
-	state := c.state
-	inner := c.inner
-	c.mu.Unlock()
-	if closed || state == nil || inner == nil {
-		return ErrClientGenerationUnavailable
-	}
-
-	opCtx, finish, err := managedOperationContext(ctx, state)
+	opCtx, inner, finish, err := c.beginOperation(ctx)
 	if err != nil {
 		return err
 	}
@@ -345,32 +430,104 @@ func (c *managedDialerClient) PostPacket(ctx context.Context, url, sessionID, se
 	return inner.PostPacket(opCtx, url, sessionID, sequence, payload)
 }
 
-func (c *managedDialerClient) Close() error {
+func (c *managedDialerClient) beginOperation(ctx context.Context) (context.Context, DialerClient, func(), error) {
 	c.mu.Lock()
-	if c.closed {
+	if c.closed || c.retired || c.state == nil || c.inner == nil {
 		c.mu.Unlock()
-		return nil
+		return nil, nil, nil, ErrClientGenerationUnavailable
 	}
-	c.closed = true
-	streams := make([]*managedReadCloser, 0, len(c.streams))
-	for stream := range c.streams {
-		streams = append(streams, stream)
-	}
+	state := c.state
 	inner := c.inner
+	c.operations++
 	c.mu.Unlock()
 
-	var closeErrors []error
-	for _, stream := range streams {
-		if err := stream.Close(); err != nil {
-			closeErrors = append(closeErrors, err)
-		}
+	opCtx, finishGeneration, err := managedOperationContext(ctx, state, c)
+	if err != nil {
+		c.finishOperation()
+		return nil, nil, nil, err
 	}
-	if closer, ok := inner.(io.Closer); ok {
-		if err := closer.Close(); err != nil {
-			closeErrors = append(closeErrors, err)
-		}
+	var once sync.Once
+	finish := func() {
+		once.Do(func() {
+			finishGeneration()
+			c.finishOperation()
+		})
 	}
-	return stderrors.Join(closeErrors...)
+	return opCtx, inner, finish, nil
+}
+
+func (c *managedDialerClient) beginBackgroundOperation() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || c.state == nil || c.inner == nil {
+		return ErrClientGenerationUnavailable
+	}
+	c.operations++
+	return nil
+}
+
+func (c *managedDialerClient) finishOperation() {
+	var onIdle func()
+	c.mu.Lock()
+	if c.operations > 0 {
+		c.operations--
+	}
+	if c.operations == 0 && c.retired {
+		onIdle = c.onIdle
+		c.onIdle = nil
+	}
+	c.mu.Unlock()
+	if onIdle != nil {
+		onIdle()
+	}
+}
+
+func (c *managedDialerClient) markRetired(onIdle func()) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.retired {
+		c.retired = true
+		c.onIdle = onIdle
+	}
+	if c.operations != 0 {
+		return false
+	}
+	c.onIdle = nil
+	return true
+}
+
+func (c *managedDialerClient) prepareGenerationRetire() {
+	c.mu.Lock()
+	c.retired = true
+	c.onIdle = nil
+	c.mu.Unlock()
+}
+
+func (c *managedDialerClient) Close() error {
+	c.closeOnce.Do(func() {
+		c.mu.Lock()
+		c.closed = true
+		streams := make([]*managedReadCloser, 0, len(c.streams))
+		for stream := range c.streams {
+			streams = append(streams, stream)
+		}
+		inner := c.inner
+		c.mu.Unlock()
+
+		var closeErrors []error
+		for _, stream := range streams {
+			if err := stream.Close(); err != nil {
+				closeErrors = append(closeErrors, err)
+			}
+		}
+		if closer, ok := inner.(io.Closer); ok {
+			if err := closer.Close(); err != nil {
+				closeErrors = append(closeErrors, err)
+			}
+		}
+		c.closeErr = stderrors.Join(closeErrors...)
+	})
+	return c.closeErr
 }
 
 func (c *managedDialerClient) release() {
@@ -378,6 +535,7 @@ func (c *managedDialerClient) release() {
 	inner := c.inner
 	c.inner = nil
 	c.state = nil
+	c.onIdle = nil
 	c.streams = nil
 	c.mu.Unlock()
 	if releaser, ok := inner.(interface{ releaseManagedLifecycle() }); ok {
@@ -392,15 +550,22 @@ func (c *managedDialerClient) removeStream(stream *managedReadCloser) {
 }
 
 type managedReadCloser struct {
-	once     sync.Once
-	inner    io.ReadCloser
-	owner    *managedDialerClient
-	finish   func()
-	closeErr error
+	once            sync.Once
+	mu              sync.Mutex
+	inner           io.ReadCloser
+	owner           *managedDialerClient
+	finishOperation func()
+	closeErr        error
 }
 
 func (r *managedReadCloser) Read(p []byte) (int, error) {
-	n, err := r.inner.Read(p)
+	r.mu.Lock()
+	inner := r.inner
+	r.mu.Unlock()
+	if inner == nil {
+		return 0, io.ErrClosedPipe
+	}
+	n, err := inner.Read(p)
 	if err != nil {
 		_ = r.Close()
 	}
@@ -408,10 +573,33 @@ func (r *managedReadCloser) Read(p []byte) (int, error) {
 }
 
 func (r *managedReadCloser) Close() error {
+	return r.finish(true)
+}
+
+func (r *managedReadCloser) finishAfterInnerClose() {
+	_ = r.finish(false)
+}
+
+func (r *managedReadCloser) finish(closeInner bool) error {
 	r.once.Do(func() {
-		r.closeErr = r.inner.Close()
-		r.owner.removeStream(r)
-		r.finish()
+		r.mu.Lock()
+		inner := r.inner
+		owner := r.owner
+		finish := r.finishOperation
+		r.inner = nil
+		r.owner = nil
+		r.finishOperation = nil
+		r.mu.Unlock()
+
+		if closeInner && inner != nil {
+			r.closeErr = inner.Close()
+		}
+		if owner != nil {
+			owner.removeStream(r)
+		}
+		if finish != nil {
+			finish()
+		}
 	})
 	return r.closeErr
 }

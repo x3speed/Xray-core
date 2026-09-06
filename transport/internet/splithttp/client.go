@@ -251,37 +251,68 @@ func (c *DefaultDialerClient) releaseManagedLifecycle() {
 
 type WaitReadCloser struct {
 	Wait chan struct{}
+
+	mu      sync.Mutex
+	ready   sync.Once
+	closed  bool
+	onClose func()
 	io.ReadCloser
 }
 
 func (w *WaitReadCloser) Set(rc io.ReadCloser) {
+	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		_ = rc.Close()
+		return
+	}
 	w.ReadCloser = rc
-	defer func() {
-		if recover() != nil {
-			rc.Close()
-		}
-	}()
-	close(w.Wait)
+	w.mu.Unlock()
+	w.ready.Do(func() { close(w.Wait) })
+}
+
+func (w *WaitReadCloser) SetCloseCallback(callback func()) {
+	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		go callback()
+		return
+	}
+	w.onClose = callback
+	w.mu.Unlock()
 }
 
 func (w *WaitReadCloser) Read(b []byte) (int, error) {
-	if w.ReadCloser == nil {
-		if <-w.Wait; w.ReadCloser == nil {
-			return 0, io.ErrClosedPipe
-		}
+	<-w.Wait
+	w.mu.Lock()
+	reader := w.ReadCloser
+	w.mu.Unlock()
+	if reader == nil {
+		return 0, io.ErrClosedPipe
 	}
-	return w.ReadCloser.Read(b)
+	return reader.Read(b)
 }
 
 func (w *WaitReadCloser) Close() error {
-	if w.ReadCloser != nil {
-		return w.ReadCloser.Close()
+	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		return nil
 	}
-	defer func() {
-		if recover() != nil && w.ReadCloser != nil {
-			w.ReadCloser.Close()
-		}
-	}()
-	close(w.Wait)
-	return nil
+	w.closed = true
+	reader := w.ReadCloser
+	w.ReadCloser = nil
+	callback := w.onClose
+	w.onClose = nil
+	w.mu.Unlock()
+
+	w.ready.Do(func() { close(w.Wait) })
+	var err error
+	if reader != nil {
+		err = reader.Close()
+	}
+	if callback != nil {
+		go callback()
+	}
+	return err
 }

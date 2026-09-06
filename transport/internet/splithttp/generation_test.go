@@ -13,7 +13,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-func TestManagedClientGenerationRotationsReleaseCache(t *testing.T) {
+func TestManagedClientGenerationPrimaryRotationsReleaseCache(t *testing.T) {
 	resetClientGenerationsForTest(t)
 	destination := xnet.TCPDestination(xnet.DomainAddress("example.com"), 443)
 	var previous ClientGeneration
@@ -62,7 +62,7 @@ func TestManagedClientGenerationRotationsReleaseCache(t *testing.T) {
 		cacheSize := len(state.cache)
 		clientGenerations.Unlock()
 		if cacheSize > 1 {
-			t.Fatalf("managed cache grew beyond one entry: %d", cacheSize)
+			t.Fatalf("primary-only managed cache grew beyond one entry: %d", cacheSize)
 		}
 
 		if err := EndClientGeneration(context.Background(), token); err != nil {
@@ -71,6 +71,182 @@ func TestManagedClientGenerationRotationsReleaseCache(t *testing.T) {
 		if state.cache != nil || state.clients != nil {
 			t.Fatal("retired generation retained cache or clients")
 		}
+	}
+}
+
+func TestManagedCacheAllowsPrimaryAndDownloadOnly(t *testing.T) {
+	resetClientGenerationsForTest(t)
+	token, err := BeginClientGeneration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	destination := xnet.TCPDestination(xnet.DomainAddress("example.com"), 443)
+
+	for i := 0; i < maxManagedDialerEntries+1; i++ {
+		config := &Config{Host: "example.com"}
+		if err := BindClientGeneration(config, token); err != nil {
+			t.Fatal(err)
+		}
+		_, _, err := getHTTPClient(context.Background(), destination, &internet.MemoryStreamConfig{
+			ProtocolName:     protocolName,
+			ProtocolSettings: config,
+		})
+		if i < maxManagedDialerEntries && err != nil {
+			t.Fatalf("managed cache entry %d was rejected: %v", i+1, err)
+		}
+		if i == maxManagedDialerEntries && !stderrors.Is(err, ErrClientGenerationCacheFull) {
+			t.Fatalf("third managed cache entry returned %v", err)
+		}
+	}
+
+	clientGenerations.Lock()
+	cacheSize := len(clientGenerations.active.cache)
+	clientGenerations.Unlock()
+	if cacheSize != maxManagedDialerEntries {
+		t.Fatalf("managed cache size = %d, want %d", cacheSize, maxManagedDialerEntries)
+	}
+	if err := EndClientGeneration(context.Background(), token); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestManagedDefaultClientPreservesPacketUploadSequencing(t *testing.T) {
+	raw := &DefaultDialerClient{}
+	managed := &managedDialerClient{inner: raw}
+	if !waitsForWroteRequest(raw) {
+		t.Fatal("default client lost packet upload sequencing")
+	}
+	if !waitsForWroteRequest(managed) {
+		t.Fatal("managed default client lost packet upload sequencing")
+	}
+	if waitsForWroteRequest(&closeErrorDialerClient{}) {
+		t.Fatal("non-default client unexpectedly enabled packet upload sequencing")
+	}
+}
+
+func TestManagedXmuxChurnReleasesEvictedClients(t *testing.T) {
+	for _, testCase := range []struct {
+		name       string
+		reuseLimit bool
+		markClosed bool
+	}{
+		{name: "reuse rotation", reuseLimit: true},
+		{name: "network error", markClosed: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			resetClientGenerationsForTest(t)
+			token, err := BeginClientGeneration()
+			if err != nil {
+				t.Fatal(err)
+			}
+			config := &Config{Host: "example.com"}
+			if testCase.reuseLimit {
+				config.Xmux = &XmuxConfig{CMaxReuseTimes: &RangeConfig{From: 1, To: 1}}
+			}
+			if err := BindClientGeneration(config, token); err != nil {
+				t.Fatal(err)
+			}
+			settings := &internet.MemoryStreamConfig{ProtocolName: protocolName, ProtocolSettings: config}
+			destination := xnet.TCPDestination(xnet.DomainAddress("example.com"), 443)
+			var first *managedDialerClient
+
+			for i := 0; i < 64; i++ {
+				client, _, err := getHTTPClient(context.Background(), destination, settings)
+				if err != nil {
+					t.Fatal(err)
+				}
+				managed := client.(*managedDialerClient)
+				if first == nil {
+					first = managed
+				}
+				if testCase.markClosed {
+					managed.mu.Lock()
+					managed.inner.(*DefaultDialerClient).closed.Store(true)
+					managed.mu.Unlock()
+				}
+
+				clientGenerations.Lock()
+				clientCount := len(clientGenerations.active.clients)
+				clientGenerations.Unlock()
+				if clientCount > 1 {
+					t.Fatalf("managed client count grew to %d after %d rotations", clientCount, i+1)
+				}
+			}
+
+			first.mu.Lock()
+			firstReleased := first.inner == nil && first.state == nil
+			first.mu.Unlock()
+			if !firstReleased {
+				t.Fatal("first evicted client retained generation references")
+			}
+			if err := EndClientGeneration(context.Background(), token); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestEvictedManagedClientClosesOnlyAfterOperationDrain(t *testing.T) {
+	resetClientGenerationsForTest(t)
+	if _, err := BeginClientGeneration(); err != nil {
+		t.Fatal(err)
+	}
+	clientGenerations.Lock()
+	state := clientGenerations.active
+	inner := &countingDialerClient{}
+	client := newManagedDialerClient(state, inner)
+	state.clients[client] = struct{}{}
+	client.mu.Lock()
+	client.operations = 2
+	client.mu.Unlock()
+	state.retireClientLocked(client)
+	_, retainedWhileActive := state.clients[client]
+	clientGenerations.Unlock()
+	if !retainedWhileActive {
+		t.Fatal("active client was released before operation drain")
+	}
+
+	client.finishOperation()
+	clientGenerations.Lock()
+	_, retainedWithBackground := state.clients[client]
+	clientGenerations.Unlock()
+	if !retainedWithBackground {
+		t.Fatal("client was released while a background operation remained")
+	}
+
+	client.finishOperation()
+	clientGenerations.Lock()
+	_, retainedAfterDrain := state.clients[client]
+	clientGenerations.Unlock()
+	if retainedAfterDrain {
+		t.Fatal("drained evicted client remained in generation registry")
+	}
+	client.mu.Lock()
+	released := client.inner == nil && client.state == nil
+	client.mu.Unlock()
+	if !released || inner.closes.Load() != 1 {
+		t.Fatalf("drained eviction release=(%v, closes=%d), want (true, 1)", released, inner.closes.Load())
+	}
+}
+
+func TestManagedReadCloserDropsReferences(t *testing.T) {
+	owner := &managedDialerClient{streams: make(map[*managedReadCloser]struct{})}
+	inner := new(countingReadCloser)
+	var finished atomic.Int32
+	stream := &managedReadCloser{inner: inner, owner: owner, finishOperation: func() { finished.Add(1) }}
+	owner.streams[stream] = struct{}{}
+
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stream.mu.Lock()
+	released := stream.inner == nil && stream.owner == nil && stream.finishOperation == nil
+	stream.mu.Unlock()
+	if !released {
+		t.Fatal("closed managed stream retained inner, owner, or finish references")
+	}
+	if inner.closes.Load() != 1 || finished.Load() != 1 {
+		t.Fatalf("close lifecycle calls = (%d, %d), want (1, 1)", inner.closes.Load(), finished.Load())
 	}
 }
 
@@ -200,6 +376,15 @@ func TestManagedGenerationCleanupErrorIsObservable(t *testing.T) {
 	if _, err := BeginClientGeneration(); !stderrors.Is(err, ErrClientGenerationActive) {
 		t.Fatalf("new generation started after failed cleanup: %v", err)
 	}
+	clientGenerations.Lock()
+	referenceFree := clientGenerations.retiring == nil && clientGenerations.quarantine != nil
+	clientGenerations.Unlock()
+	client.mu.Lock()
+	clientReleased := client.inner == nil && client.state == nil && client.streams == nil
+	client.mu.Unlock()
+	if !referenceFree || !clientReleased {
+		t.Fatal("cleanup-error quarantine retained generation client references")
+	}
 }
 
 func resetClientGenerationsForTest(t *testing.T) {
@@ -216,6 +401,7 @@ func resetClientGenerationsForTest(t *testing.T) {
 		clientGenerations.next = 0
 		clientGenerations.active = nil
 		clientGenerations.retiring = nil
+		clientGenerations.quarantine = nil
 	}
 	reset()
 	t.Cleanup(reset)
@@ -247,3 +433,33 @@ func (*closeErrorDialerClient) PostPacket(context.Context, string, string, strin
 }
 
 func (c *closeErrorDialerClient) Close() error { return c.err }
+
+type countingDialerClient struct {
+	closes atomic.Int32
+}
+
+func (*countingDialerClient) IsClosed() bool { return false }
+
+func (*countingDialerClient) OpenStream(context.Context, string, string, io.Reader, bool) (io.ReadCloser, xnet.Addr, xnet.Addr, error) {
+	return nil, nil, nil, nil
+}
+
+func (*countingDialerClient) PostPacket(context.Context, string, string, string, buf.MultiBuffer) error {
+	return nil
+}
+
+func (c *countingDialerClient) Close() error {
+	c.closes.Add(1)
+	return nil
+}
+
+type countingReadCloser struct {
+	closes atomic.Int32
+}
+
+func (*countingReadCloser) Read([]byte) (int, error) { return 0, io.EOF }
+
+func (c *countingReadCloser) Close() error {
+	c.closes.Add(1)
+	return nil
+}
