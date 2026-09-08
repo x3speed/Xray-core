@@ -84,6 +84,7 @@ type Handler struct {
 	defaultDispatcher      routing.Dispatcher
 	ctx                    context.Context
 	fallbacks              map[string]map[string]map[string]*Fallback // or nil
+	authenticated          authenticatedObserverSlot
 	// regexps               map[string]*regexp.Regexp       // or nil
 }
 
@@ -262,13 +263,28 @@ func (h *Handler) GetUsersCount(context.Context) int64 {
 	return h.validator.GetCount()
 }
 
+// SetAuthenticatedConnectionObserver installs the single per-handler gate used
+// after VLESS authentication and before any application data dispatch.
+func (h *Handler) SetAuthenticatedConnectionObserver(observer AuthenticatedConnectionObserver) error {
+	if h == nil {
+		return authenticatedConnectionError()
+	}
+	return h.authenticated.register(observer)
+}
+
 // Network implements proxy.Inbound.Network().
 func (*Handler) Network() []net.Network {
 	return []net.Network{net.Network_TCP, net.Network_UNIX}
 }
 
 // Process implements proxy.Inbound.Process().
-func (h *Handler) Process(ctx context.Context, network net.Network, connection stat.Connection, dispatch routing.Dispatcher) error {
+func (h *Handler) Process(ctx context.Context, network net.Network, connection stat.Connection, dispatch routing.Dispatcher) (processErr error) {
+	authenticatedObserver := h.authenticated.begin()
+	defer func() {
+		if !missingAuthenticatedValue(authenticatedObserver) && processErr != nil {
+			processErr = authenticatedConnectionError()
+		}
+	}()
 	iConn := stat.TryUnwrapStatsConn(connection)
 
 	if h.decryption != nil {
@@ -311,6 +327,9 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	}
 
 	if err != nil {
+		if !missingAuthenticatedValue(authenticatedObserver) {
+			return authenticatedConnectionError()
+		}
 		if isfb {
 			if err := connection.SetReadDeadline(time.Time{}); err != nil {
 				errors.LogWarningInner(ctx, err, "unable to set back read deadline")
@@ -524,10 +543,12 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		return err
 	}
 
-	if err := connection.SetReadDeadline(time.Time{}); err != nil {
+	if err := connection.SetReadDeadline(time.Time{}); err != nil && missingAuthenticatedValue(authenticatedObserver) {
 		errors.LogWarningInner(ctx, err, "unable to set back read deadline")
 	}
-	errors.LogInfo(ctx, "received request for ", request.Destination())
+	if missingAuthenticatedValue(authenticatedObserver) {
+		errors.LogInfo(ctx, "received request for ", request.Destination())
+	}
 
 	inbound := session.InboundFromContext(ctx)
 	if inbound == nil {
@@ -540,6 +561,9 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	account := request.User.Account.(*vless.MemoryAccount)
 
 	if account.Reverse != nil && request.Command != protocol.RequestCommandRvs {
+		if !missingAuthenticatedValue(authenticatedObserver) {
+			return authenticatedConnectionError()
+		}
 		return errors.New("for safety reasons, user " + account.ID.String() + " is not allowed to use forward proxy")
 	}
 
@@ -586,27 +610,50 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 				rawInput = (*bytes.Buffer)(unsafe.Pointer(p + r.Offset))
 			}
 		} else {
+			if !missingAuthenticatedValue(authenticatedObserver) {
+				return authenticatedConnectionError()
+			}
 			return errors.New("account " + account.ID.String() + " is not able to use the flow " + requestAddons.Flow).AtWarning()
 		}
 	case "":
 		inbound.CanSpliceCopy = 3
 		if account.Flow == vless.XRV && (request.Command == protocol.RequestCommandTCP || isMuxAndNotXUDP(request, first)) {
+			if !missingAuthenticatedValue(authenticatedObserver) {
+				return authenticatedConnectionError()
+			}
 			return errors.New("account " + account.ID.String() + " is rejected since the client flow is empty. Note that the pure TLS proxy has certain TLS in TLS characters.").AtWarning()
 		}
 	default:
 		return errors.New("unknown request flow " + requestAddons.Flow).AtWarning()
 	}
 
-	if request.Command != protocol.RequestCommandMux {
-		ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
-			From:   connection.RemoteAddr(),
-			To:     request.Destination(),
-			Status: log.AccessAccepted,
-			Reason: "",
-			Email:  request.User.Email,
-		})
-	} else if account.Flow == vless.XRV {
-		ctx = session.ContextWithAllowedNetwork(ctx, net.Network_UDP)
+	var authenticatedLifetime *authenticatedConnectionLifetime
+	if !missingAuthenticatedValue(authenticatedObserver) {
+		if network != net.Network_TCP || request.Command != protocol.RequestCommandTCP {
+			return authenticatedConnectionError()
+		}
+		var authenticatedErr error
+		authenticatedLifetime, ctx, authenticatedErr = acceptAuthenticatedConnection(
+			ctx, connection, authenticatedObserver, &h.authenticated, request.User.Email, inbound.Tag,
+		)
+		if authenticatedErr != nil {
+			return authenticatedErr
+		}
+		defer authenticatedLifetime.Close()
+	}
+
+	if missingAuthenticatedValue(authenticatedObserver) {
+		if request.Command != protocol.RequestCommandMux {
+			ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
+				From:   connection.RemoteAddr(),
+				To:     request.Destination(),
+				Status: log.AccessAccepted,
+				Reason: "",
+				Email:  request.User.Email,
+			})
+		} else if account.Flow == vless.XRV {
+			ctx = session.ContextWithAllowedNetwork(ctx, net.Network_UDP)
+		}
 	}
 
 	trafficState := proxy.NewTrafficState(userSentID)
@@ -630,6 +677,9 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		return r.NewMux(ctx, dispatcher.WrapLink(ctx, h.policyManager, h.stats, &transport.Link{Reader: clientReader, Writer: clientWriter}), h.observer)
 	}
 
+	if authenticatedLifetime != nil && (!authenticatedLifetime.live() || ctx.Err() != nil) {
+		return authenticatedConnectionError()
+	}
 	if err := dispatch.DispatchLink(ctx, request.Destination(), &transport.Link{
 		Reader: clientReader,
 		Writer: clientWriter},
