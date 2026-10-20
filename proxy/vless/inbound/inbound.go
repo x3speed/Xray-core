@@ -629,12 +629,12 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 
 	var authenticatedLifetime *authenticatedConnectionLifetime
 	if !missingAuthenticatedValue(authenticatedObserver) {
-		if network != net.Network_TCP || request.Command != protocol.RequestCommandTCP {
+		if network != net.Network_TCP || (request.Command != protocol.RequestCommandTCP && request.Command != protocol.RequestCommandUDP) || requestAddons.Flow != "" {
 			return authenticatedConnectionError()
 		}
 		var authenticatedErr error
 		authenticatedLifetime, ctx, authenticatedErr = acceptAuthenticatedConnection(
-			ctx, connection, authenticatedObserver, &h.authenticated, request.User.Email, inbound.Tag,
+			ctx, connection, authenticatedObserver, &h.authenticated, request.User.Email, inbound.Tag, request.Destination(),
 		)
 		if authenticatedErr != nil {
 			return authenticatedErr
@@ -679,6 +679,16 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 
 	if authenticatedLifetime != nil && (!authenticatedLifetime.live() || ctx.Err() != nil) {
 		return authenticatedConnectionError()
+	}
+	if authenticatedLifetime != nil {
+		clientReader = &authenticatedReader{source:clientReader,owner:authenticatedLifetime,destination:request.Destination()}
+		clientWriter = &authenticatedWriter{target:clientWriter,owner:authenticatedLifetime,destination:request.Destination()}
+	}
+	if authenticatedLifetime != nil {
+		if control,ok:=authenticatedLifetime.lease.(interface{HandleAuthenticatedControl(context.Context,*transport.Link)(bool,error)});ok{
+			handled,err:=control.HandleAuthenticatedControl(ctx,&transport.Link{Reader:clientReader,Writer:clientWriter})
+			if handled||err!=nil{return err}
+		}
 	}
 	if err := dispatch.DispatchLink(ctx, request.Destination(), &transport.Link{
 		Reader: clientReader,

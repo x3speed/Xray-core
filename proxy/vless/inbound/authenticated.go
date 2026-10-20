@@ -3,6 +3,7 @@ package inbound
 import (
 	"context"
 	"crypto/rand"
+	xnet "github.com/xtls/xray-core/common/net"
 	"io"
 	"reflect"
 	"sync"
@@ -49,6 +50,8 @@ type authenticatedConnectionState struct {
 	inboundTag string
 	id         [32]byte
 	directTCP  bool
+	network string
+	destination string
 	done       chan struct{}
 	consumed   atomic.Bool
 	terminal   atomic.Bool
@@ -91,6 +94,15 @@ func (identity AuthenticatedConnectionIdentity) ConnectionID() [32]byte {
 func (identity AuthenticatedConnectionIdentity) DirectTCP() bool {
 	state := identity.liveState()
 	return state != nil && state.directTCP
+}
+
+// Network and DestinationAddress are captured from the authenticated parsed
+// request, before dispatch. No observer or request metadata can replace them.
+func (identity AuthenticatedConnectionIdentity) Network() string {
+	if state:=identity.liveState();state!=nil{return state.network};return ""
+}
+func (identity AuthenticatedConnectionIdentity) DestinationAddress() string {
+	if state:=identity.liveState();state!=nil{return state.destination};return ""
 }
 
 func (identity AuthenticatedConnectionIdentity) Done() <-chan struct{} {
@@ -141,7 +153,7 @@ func (slot *authenticatedObserverSlot) begin() AuthenticatedConnectionObserver {
 	return slot.observer
 }
 
-func (slot *authenticatedObserverSlot) mint(email, inboundTag string) (*AuthenticatedConnection, error) {
+func (slot *authenticatedObserverSlot) mint(email, inboundTag string, destinations ...xnet.Destination) (*AuthenticatedConnection, error) {
 	slot.mu.Lock()
 	random := slot.random
 	slot.mu.Unlock()
@@ -150,6 +162,12 @@ func (slot *authenticatedObserverSlot) mint(email, inboundTag string) (*Authenti
 	}
 	state := &authenticatedConnectionState{
 		seal: trustedAuthenticatedConnectionSeal, email: email, inboundTag: inboundTag, directTCP: true, done: make(chan struct{}),
+	}
+	if len(destinations)==1 && destinations[0].Address!=nil && destinations[0].Port!=0 {
+		destination:=destinations[0]
+		if destination.Network==xnet.Network_TCP {state.network="tcp"} else if destination.Network==xnet.Network_UDP {state.network="udp"}
+		state.destination=destination.NetAddr()
+		state.directTCP=destination.Network==xnet.Network_TCP
 	}
 	if _, err := io.ReadFull(random, state.id[:]); err != nil || state.id == [32]byte{} {
 		state.finish()
@@ -181,11 +199,12 @@ func acceptAuthenticatedConnection(
 	observer AuthenticatedConnectionObserver,
 	slot *authenticatedObserverSlot,
 	email, inboundTag string,
+	destinations ...xnet.Destination,
 ) (*authenticatedConnectionLifetime, context.Context, error) {
 	if missingAuthenticatedValue(ctx) || missingAuthenticatedValue(connection) || missingAuthenticatedValue(observer) || slot == nil || email == "" || inboundTag == "" {
 		return nil, ctx, authenticatedConnectionError()
 	}
-	token, err := slot.mint(email, inboundTag)
+	token, err := slot.mint(email, inboundTag, destinations...)
 	if err != nil {
 		return nil, ctx, err
 	}

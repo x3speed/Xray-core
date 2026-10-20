@@ -267,7 +267,7 @@ func TestAuthenticatedRegistrationAndTokenAreOneShot(t *testing.T) {
 
 func TestAuthenticatedHandlerRejectsFailedAuthFallbackTypesAndEntropy(t *testing.T) {
 	commands := []protocol.RequestCommand{
-		protocol.RequestCommandUDP, protocol.RequestCommandMux, protocol.RequestCommandRvs, protocol.RequestCommand(99),
+		protocol.RequestCommandMux, protocol.RequestCommandRvs, protocol.RequestCommand(99),
 	}
 	for _, command := range commands {
 		handler, request := newAuthenticatedTestHandler(t, command)
@@ -452,3 +452,18 @@ func runAuthenticatedProcessOnNetwork(handler *Handler, request []byte, dispatch
 type authenticatedErrorReader struct{}
 
 func (authenticatedErrorReader) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+
+func TestAuthenticatedParsedDestinationIsImmutableAndDiesWithOwner(t *testing.T) {
+	slot:=&authenticatedObserverSlot{}
+	for _,network:=range []xnet.Network{xnet.Network_TCP,xnet.Network_UDP}{
+		destination:=xnet.Destination{Network:network,Address:xnet.DomainAddress("control.example"),Port:9443}
+		token,err:=slot.mint(authenticatedTestEmail,authenticatedTestTag,destination)
+		if err!=nil{t.Fatal(err)}
+		identity,ok:=token.Consume()
+		if !ok||identity.DestinationAddress()!="control.example:9443"{t.Fatal("parsed target lost")}
+		destination.Port=443
+		if identity.DestinationAddress()!="control.example:9443"{t.Fatal("caller mutated target")}
+		token.state.finish()
+		if identity.DestinationAddress()!=""||identity.Network()!=""{t.Fatal("retired identity survived")}
+	}
+}

@@ -79,7 +79,7 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 	handler := &Handler{
 		server:        server,
 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
-		cone:          ctx.Value("cone").(bool),
+		cone:          ctx.Value("cone").(bool) && ctx.Value(fixedUDPAssociationKey{}) != true,
 	}
 
 	a := handler.server.User.Account.(*vless.MemoryAccount)
@@ -486,4 +486,12 @@ func (r *Reverse) Start() error {
 
 func (r *Reverse) Close() error {
 	return r.monitorTask.Close()
+}
+
+// WithFixedUDPAssociation disables cone-to-XUDP rewriting for an explicitly
+// selected product instance. Each ordinary UDP request retains its one parsed
+// destination and length-framed datagrams; it never changes legacy defaults.
+type fixedUDPAssociationKey struct{}
+func WithFixedUDPAssociation(ctx context.Context) context.Context {
+	return context.WithValue(ctx,fixedUDPAssociationKey{},true)
 }
