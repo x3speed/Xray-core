@@ -17,6 +17,8 @@ import (
 type Commander struct {
 	sync.Mutex
 	server   *grpc.Server
+	listener net.Listener
+	serveWG  sync.WaitGroup
 	services []Service
 	ohm      outbound.Manager
 	tag      string
@@ -61,56 +63,60 @@ func (c *Commander) Type() interface{} {
 // Start implements common.Runnable.
 func (c *Commander) Start() error {
 	c.Lock()
-	c.server = grpc.NewServer()
+	defer c.Unlock()
+	if c.server != nil {
+		return errors.New("API server already started")
+	}
+	server := grpc.NewServer()
 	for _, service := range c.services {
-		service.Register(c.server)
+		service.Register(server)
 	}
-	c.Unlock()
-
-	var listen = func(listener net.Listener) {
-		if err := c.server.Serve(listener); err != nil {
-			errors.LogErrorInner(context.Background(), err, "failed to start grpc server")
-		}
-	}
-
+	var listener net.Listener
 	if len(c.listen) > 0 {
-		if l, err := net.Listen("tcp", c.listen); err != nil {
+		l, err := net.Listen("tcp", c.listen)
+		if err != nil {
+			server.Stop()
 			errors.LogErrorInner(context.Background(), err, "API server failed to listen on ", c.listen)
 			return err
-		} else {
-			errors.LogInfo(context.Background(), "API server listening on ", l.Addr())
-			go listen(l)
 		}
-		return nil
+		listener = l
+		errors.LogInfo(context.Background(), "API server listening on ", l.Addr())
+	} else {
+		l := &OutboundListener{buffer: make(chan net.Conn, 4), done: done.New()}
+		if err := c.ohm.RemoveHandler(context.Background(), c.tag); err != nil {
+			errors.LogInfoInner(context.Background(), err, "failed to remove existing handler")
+		}
+		if err := c.ohm.AddHandler(context.Background(), &Outbound{tag: c.tag, listener: l}); err != nil {
+			l.Close()
+			server.Stop()
+			return err
+		}
+		listener = l
 	}
-
-	listener := &OutboundListener{
-		buffer: make(chan net.Conn, 4),
-		done:   done.New(),
-	}
-
-	go listen(listener)
-
-	if err := c.ohm.RemoveHandler(context.Background(), c.tag); err != nil {
-		errors.LogInfoInner(context.Background(), err, "failed to remove existing handler")
-	}
-
-	return c.ohm.AddHandler(context.Background(), &Outbound{
-		tag:      c.tag,
-		listener: listener,
-	})
+	c.server = server
+	c.listener = listener
+	c.serveWG.Add(1)
+	go func() {
+		defer c.serveWG.Done()
+		if err := server.Serve(listener); err != nil {
+			errors.LogErrorInner(context.Background(), err, "failed to start grpc server")
+		}
+	}()
+	return nil
 }
 
 // Close implements common.Closable.
 func (c *Commander) Close() error {
 	c.Lock()
 	defer c.Unlock()
-
 	if c.server != nil {
 		c.server.Stop()
+		// Serve may not have registered the listener before Stop completed.
+		c.listener.Close()
+		c.serveWG.Wait()
+		c.listener = nil
 		c.server = nil
 	}
-
 	return nil
 }
 
